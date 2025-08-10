@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.env
+.venv
+env/
+venv/
+ENV/
+.ipynb_checkpoints
+*.sqlite3
+*.log
+
+# Data files
+historical_trader.csv
+fear_greed.csv
+*.xlsx
+*.xls
+*.json
+*.zip
+
+# VSCode / IDE settings
+.vscode/
+.idea/

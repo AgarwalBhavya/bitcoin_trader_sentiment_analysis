@@ -1,0 +1,274 @@
+"""
+Bitcoin Trader Performance vs Fear-Greed Sentiment
+File: bitcoin_trader_sentiment_analysis.
+
+Outputs saved to ./outputs/:
+ - merged_data.csv
+ - summary_metrics.csv
+ - several PNG charts (pnl_by_sentiment.png, volume_by_sentiment.png, leverage_by_sentiment.png, rolling_corr.png)
+
+Description:
+ This script performs data cleaning, merges the Fear-Greed sentiment dataset with historical trade data
+ (matching by trade date), computes aggregated metrics, visualizations, and simple statistical tests to
+ explore relationships between market sentiment and trader performance.
+"""
+
+import os
+import sys
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+from scipy import stats
+
+OUTPUT_DIR = Path("outputs")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+
+def safe_read_csv(path):
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    df = pd.read_csv(path)
+    return df
+
+
+def load_and_clean_sentiment(path="fear_greed.csv"):
+    df = safe_read_csv(path)
+    # normalize column names
+    df.columns = [c.strip() for c in df.columns]
+    # common conversions
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    elif 'timestamp' in df.columns:
+        df['date'] = pd.to_datetime(df['timestamp'], unit='s', errors='coerce')
+    else:
+        raise ValueError('Sentiment CSV must contain a date or timestamp column')
+
+    # ensure classification and value columns
+    possible_class_cols = [c for c in df.columns if c.lower().startswith('class') or 'fear' in c.lower()]
+    if possible_class_cols:
+        df.rename(columns={possible_class_cols[0]: 'classification'}, inplace=True)
+    if 'value' not in df.columns:
+        # try common alternatives
+        alt = [c for c in df.columns if 'value' in c.lower() or 'score' in c.lower()]
+        if alt:
+            df.rename(columns={alt[0]: 'value'}, inplace=True)
+        else:
+            df['value'] = np.nan
+
+    df = df[['date', 'value', 'classification']].copy()
+    df['sentiment_date'] = df['date'].dt.date
+    return df
+
+
+def load_and_clean_trades(path="historical_trader.csv"):
+    df = safe_read_csv(path)
+    # normalize
+    df.columns = [c.strip() for c in df.columns]
+    # try to find timestamp column
+    timestamp_cols = [c for c in df.columns if 'timestamp' in c.lower()]
+    if not timestamp_cols:
+        raise ValueError('No timestamp column found in trades CSV')
+    ts_col = timestamp_cols[0]
+    df['Timestamp'] = pd.to_datetime(df[ts_col], errors='coerce')
+    df['trade_date'] = df['Timestamp'].dt.date
+
+    # normalize Closed PnL
+    pnl_cols = [c for c in df.columns if 'pnl' in c.lower() or 'closed' in c.lower()]
+    if pnl_cols:
+        df.rename(columns={pnl_cols[0]: 'Closed PnL'}, inplace=True)
+    else:
+        df['Closed PnL'] = np.nan
+
+    # Size USD
+    size_usd_cols = [c for c in df.columns if 'size usd' in c.lower() or 'size_usd' in c.lower() or 'sizeusd' in c.lower()]
+    if size_usd_cols:
+        df.rename(columns={size_usd_cols[0]: 'Size USD'}, inplace=True)
+    else:
+        # maybe there's a column named Size or Size Tokens
+        alt = [c for c in df.columns if 'size' == c.lower() or 'size tokens' in c.lower()]
+        if alt:
+            df.rename(columns={alt[0]: 'Size Tokens'}, inplace=True)
+            df['Size USD'] = np.nan
+        else:
+            df['Size USD'] = np.nan
+
+    # leverage
+    lev = [c for c in df.columns if 'lever' in c.lower()]
+    if lev:
+        df.rename(columns={lev[0]: 'leverage'}, inplace=True)
+    else:
+        df['leverage'] = np.nan
+
+    # Direction/Side
+    side_cols = [c for c in df.columns if c.lower() in ('side', 'direction')]
+    if side_cols:
+        df.rename(columns={side_cols[0]: 'side'}, inplace=True)
+    else:
+        df['side'] = np.nan
+
+    # ensure Closed PnL numeric
+    df['Closed PnL'] = pd.to_numeric(df['Closed PnL'], errors='coerce')
+    df['Size USD'] = pd.to_numeric(df['Size USD'], errors='coerce')
+
+    return df
+
+
+def merge_sentiment_trades(trades_df, sentiment_df):
+    merged = trades_df.merge(
+        sentiment_df[['sentiment_date', 'classification', 'value']],
+        left_on='trade_date',
+        right_on='sentiment_date',
+        how='left'
+    )
+    # fill missing classification with 'Unknown'
+    merged['classification'] = merged['classification'].fillna('Unknown')
+    return merged
+
+
+def aggregate_metrics(merged_df):
+    # Basic aggregates by sentiment classification
+    agg = merged_df.groupby('classification').agg(
+        trades_count=pd.NamedAgg(column='trade_date', aggfunc='count'),
+        total_pnl=pd.NamedAgg(column='Closed PnL', aggfunc='sum'),
+        mean_pnl=pd.NamedAgg(column='Closed PnL', aggfunc='mean'),
+        median_pnl=pd.NamedAgg(column='Closed PnL', aggfunc='median'),
+        total_volume_usd=pd.NamedAgg(column='Size USD', aggfunc='sum'),
+        mean_leverage=pd.NamedAgg(column='leverage', aggfunc='mean')
+    ).reset_index()
+
+    # direction distribution
+    dir_counts = merged_df.groupby(['classification', 'side']).size().unstack(fill_value=0)
+
+    return agg, dir_counts
+
+
+def plot_simple_charts(agg, dir_counts, merged_df):
+    # Bar chart: mean PnL by sentiment
+    plt.figure(figsize=(8,5))
+    plt.bar(agg['classification'], agg['mean_pnl'])
+    plt.title('Mean Closed PnL by Sentiment')
+    plt.ylabel('Mean Closed PnL')
+    plt.xlabel('Sentiment')
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / 'pnl_by_sentiment.png')
+    plt.close()
+
+    # Volume by sentiment
+    plt.figure(figsize=(8,5))
+    plt.bar(agg['classification'], agg['total_volume_usd'])
+    plt.title('Total Volume (USD) by Sentiment')
+    plt.ylabel('Total Volume (USD)')
+    plt.xlabel('Sentiment')
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / 'volume_by_sentiment.png')
+    plt.close()
+
+    # Leverage by sentiment (boxplot)
+    plt.figure(figsize=(8,5))
+    classifications = merged_df['classification'].unique()
+    data = [merged_df.loc[merged_df['classification']==c, 'leverage'].dropna() for c in classifications]
+    plt.boxplot(data, labels=classifications)
+    plt.title('Leverage distribution by Sentiment')
+    plt.ylabel('Leverage')
+    plt.xlabel('Sentiment')
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / 'leverage_by_sentiment.png')
+    plt.close()
+
+    # Direction stacked bar
+    dir_counts.plot(kind='bar', stacked=True, figsize=(9,6))
+    plt.title('Trade Direction Counts by Sentiment')
+    plt.ylabel('Counts')
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / 'direction_by_sentiment.png')
+    plt.close()
+
+
+def rolling_correlation_analysis(merged_df, window_days=7):
+    # compute daily aggregated PnL and average sentiment value
+    daily = merged_df.groupby('trade_date').agg(
+        daily_pnl=pd.NamedAgg(column='Closed PnL', aggfunc='sum'),
+        avg_sentiment=pd.NamedAgg(column='value', aggfunc='mean'),
+    ).reset_index()
+    daily['trade_date'] = pd.to_datetime(daily['trade_date'])
+    daily = daily.sort_values('trade_date')
+
+    daily['rolling_pnl'] = daily['daily_pnl'].rolling(window=window_days, min_periods=1).mean()
+    daily['rolling_sentiment'] = daily['avg_sentiment'].rolling(window=window_days, min_periods=1).mean()
+
+    # rolling correlation
+    rolling_corr = daily['rolling_pnl'].rolling(window=window_days).corr(daily['rolling_sentiment'])
+
+    plt.figure(figsize=(10,5))
+    plt.plot(daily['trade_date'], rolling_corr)
+    plt.title(f'Rolling correlation (window={window_days} days) between PnL and Sentiment')
+    plt.xlabel('Date')
+    plt.ylabel('Rolling correlation')
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / 'rolling_corr.png')
+    plt.close()
+
+    return daily, rolling_corr
+
+
+def statistical_test_by_sentiment(merged_df, pos_label='Greed'):
+    # Two-sample t-test: PnL in Greed vs Fear (if both exist)
+    groups = merged_df.groupby('classification')['Closed PnL']
+    # try to pick Greed and Fear
+    greed = merged_df.loc[merged_df['classification'].str.contains('Greed', case=False, na=False), 'Closed PnL'].dropna()
+    fear = merged_df.loc[merged_df['classification'].str.contains('Fear', case=False, na=False), 'Closed PnL'].dropna()
+
+    result = None
+    if len(greed) >= 5 and len(fear) >= 5:
+        tstat, pvalue = stats.ttest_ind(greed, fear, equal_var=False, nan_policy='omit')
+        result = {'tstat': float(tstat), 'pvalue': float(pvalue), 'n_greed': len(greed), 'n_fear': len(fear)}
+    return result
+
+
+def save_outputs(merged_df, agg, dir_counts, daily):
+    merged_df.to_csv(OUTPUT_DIR / 'merged_data.csv', index=False)
+    agg.to_csv(OUTPUT_DIR / 'summary_metrics.csv', index=False)
+    dir_counts.to_csv(OUTPUT_DIR / 'direction_counts.csv')
+    daily.to_csv(OUTPUT_DIR / 'daily_aggregates.csv', index=False)
+
+
+def main(sentiment_path='fear_greed.csv', trades_path='historical_trader.csv'):
+    print('Loading data...')
+    s = load_and_clean_sentiment(sentiment_path)
+    t = load_and_clean_trades(trades_path)
+    print(f'Sentiment rows: {len(s)}, Trades rows: {len(t)}')
+
+    merged = merge_sentiment_trades(t, s)
+    print(f'Merged rows: {len(merged)}')
+
+    agg, dir_counts = aggregate_metrics(merged)
+    print('\nAggregate metrics by sentiment:')
+    print(agg)
+
+    # plot charts
+    plot_simple_charts(agg, dir_counts, merged)
+
+    # rolling analysis
+    daily, rolling_corr = rolling_correlation_analysis(merged, window_days=7)
+
+    # stats test
+    stat_res = statistical_test_by_sentiment(merged)
+    if stat_res:
+        print('\nT-test results comparing Greed vs Fear Closed PnL:')
+        print(stat_res)
+    else:
+        print('\nNot enough data for statistical t-test between Greed and Fear groups.')
+
+    # save outputs
+    save_outputs(merged, agg, dir_counts, daily)
+    print(f'Outputs saved to {OUTPUT_DIR.resolve()}')
+
+
+if __name__ == '__main__':
+    # allow optional custom filenames via CLI
+    sentiment_path = sys.argv[1] if len(sys.argv) > 1 else 'fear_greed.csv'
+    trades_path = sys.argv[2] if len(sys.argv) > 2 else 'historical_trader.csv'
+    main(sentiment_path, trades_path)
